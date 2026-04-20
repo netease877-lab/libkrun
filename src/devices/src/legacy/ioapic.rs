@@ -100,6 +100,8 @@ pub struct IoApic {
     version: u8,
     irq_eoi: [i32; IOAPIC_NUM_PINS],
     irq_routes: Vec<kvm_irq_routing_entry>,
+    /// Track which pins have had their GSI route allocated (lazy allocation)
+    gsi_allocated: [bool; IOAPIC_NUM_PINS],
     irq_sender: crossbeam_channel::Sender<WorkerMessage>,
 }
 
@@ -126,14 +128,16 @@ impl IoApic {
             version: 0x20,
             irq_eoi: [0; IOAPIC_NUM_PINS],
             irq_routes: Vec::with_capacity(IOAPIC_NUM_PINS),
+            gsi_allocated: [false; IOAPIC_NUM_PINS],
             irq_sender: _irq_sender,
         };
 
-        (0..IOAPIC_NUM_PINS).for_each(|i| ioapic.add_msi_route(i));
+        // Lazy GSI allocation: Do NOT pre-allocate routes for all pins.
+        // Routes will be allocated on-demand when an interrupt is first unmasked.
+        // This prevents exhausting KVM_MAX_IRQ_ROUTES (4096) with unused routes.
 
-        let mut routing = KvmIrqRouting::new(ioapic.irq_routes.len()).unwrap();
-        let routing_entires = routing.as_mut_slice();
-        routing_entires.copy_from_slice(ioapic.irq_routes.as_slice());
+        // Set up empty routing table initially
+        let routing = KvmIrqRouting::new(0).unwrap();
         vm.set_gsi_routing(&routing)?;
 
         Ok(ioapic)
@@ -227,6 +231,12 @@ impl IoApic {
             let info = self.parse_entry(&self.ioredtbl[i]);
 
             if info.masked == 0 {
+                // Lazy GSI allocation: allocate route only when first unmasked
+                if !self.gsi_allocated[i] {
+                    self.add_msi_route(i);
+                    self.gsi_allocated[i] = true;
+                }
+
                 let msg = MsiMessage {
                     address: info.addr as u64,
                     data: info.data as u64,
@@ -234,6 +244,7 @@ impl IoApic {
 
                 self.update_msi_route(i, &msg);
             }
+            // If masked and GSI was never allocated, no action needed
         }
 
         let (response_sender, response_receiver) = unbounded();
